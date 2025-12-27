@@ -6,6 +6,7 @@ const StringHashMap = std.StringHashMap;
 const errors = @import("errors.zig");
 const stack_mod = @import("stack.zig");
 const Stack = stack_mod.Stack;
+const Value = @import("value.zig").Value;
 const module_mod = @import("module.zig");
 const Module = module_mod.Module;
 const word_mod = @import("word.zig");
@@ -39,25 +40,21 @@ pub const Interpreter = struct {
     is_compiling: bool,
     is_memo_definition: bool,
     cur_definition: ?*DefinitionWord,
-    previous_token: ?Token,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) !Interpreter {
         const app_module = Module.init(allocator, "", "");
-        var module_stack = ArrayList(*Module){};
-        try module_stack.append(allocator, @constCast(&app_module));
 
         var interp = Interpreter{
             .stack = Stack.init(allocator),
             .app_module = app_module,
-            .module_stack = module_stack,
+            .module_stack = ArrayList(*Module){},  // Initialize empty - will be fixed after copy
             .registered_modules = StringHashMap(*Module).init(allocator),
             .tokenizer_stack = ArrayList(*Tokenizer){},
             .literal_handlers = ArrayList(LiteralHandler){},
             .is_compiling = false,
             .is_memo_definition = false,
             .cur_definition = null,
-            .previous_token = null,
             .allocator = allocator,
         };
 
@@ -66,8 +63,16 @@ pub const Interpreter = struct {
         return interp;
     }
 
+    /// Must be called after init() if the Interpreter is moved/copied
+    /// This fixes the module_stack to point to the app_module at its new location
+    pub fn fixupAfterMove(self: *Interpreter) !void {
+        // Clear and rebuild module_stack to point to the correct app_module location
+        self.module_stack.clearRetainingCapacity();
+        try self.module_stack.append(self.allocator, &self.app_module);
+    }
+
     pub fn deinit(self: *Interpreter) void {
-        self.stack.deinit(self.allocator);
+        self.stack.deinit();
         self.app_module.deinit();
         self.module_stack.deinit(self.allocator);
         self.registered_modules.deinit();
@@ -79,15 +84,15 @@ pub const Interpreter = struct {
     // Stack Operations
     // ========================================================================
 
-    pub fn stackPush(self: *Interpreter, value: ?*anyopaque) !void {
-        try self.stack.push(self.allocator, value);
+    pub fn stackPush(self: *Interpreter, value: Value) !void {
+        try self.stack.push(value);
     }
 
-    pub fn stackPop(self: *Interpreter) !?*anyopaque {
+    pub fn stackPop(self: *Interpreter) !Value {
         return try self.stack.pop();
     }
 
-    pub fn stackPeek(self: *const Interpreter) !?*anyopaque {
+    pub fn stackPeek(self: *const Interpreter) !*const Value {
         return try self.stack.peek();
     }
 
@@ -115,7 +120,7 @@ pub const Interpreter = struct {
         if (self.module_stack.items.len <= 1) {
             return errors.ForthicErrorType.ModuleError;
         }
-        return self.module_stack.pop();
+        return self.module_stack.pop() orelse return errors.ForthicErrorType.ModuleError;
     }
 
     pub fn registerModule(self: *Interpreter, module: *Module) !void {
@@ -140,12 +145,15 @@ pub const Interpreter = struct {
     fn findLiteralWord(self: *Interpreter, name: []const u8) !?Word {
         for (self.literal_handlers.items) |handler| {
             if (try handler(self.allocator, name)) |lit_value| {
-                // Create a word that pushes this literal value
-                // Allocate the literal value on heap
-                const value_ptr = try self.allocator.create(LiteralValue);
-                value_ptr.* = lit_value;
+                // Convert LiteralValue to Value
+                const value = switch (lit_value) {
+                    .bool_value => |b| Value.initBool(b),
+                    .int_value => |i| Value.initInt(i),
+                    .float_value => |f| Value.initFloat(f),
+                    .time_value, .date_value, .datetime_value => |dt| Value.initDateTime(dt),
+                };
 
-                const push_word = PushValueWord.init("<literal>", value_ptr);
+                const push_word = PushValueWord.init("<literal>", value);
                 var word_ptr = try self.allocator.create(PushValueWord);
                 word_ptr.* = push_word;
                 return word_ptr.asWord();
@@ -183,14 +191,15 @@ pub const Interpreter = struct {
     // ========================================================================
 
     pub fn run(self: *Interpreter, code: []const u8) !void {
-        var tokenizer = try Tokenizer.init(self.allocator, code, null, false);
-        defer tokenizer.deinit();
+        const tokenizer = try Tokenizer.init(self.allocator, code, null, false);
+        // Note: Don't deinit tokenizer here - we copy it to heap and deinit the heap copy
 
         const tokenizer_ptr = try self.allocator.create(Tokenizer);
         tokenizer_ptr.* = tokenizer;
         try self.tokenizer_stack.append(self.allocator, tokenizer_ptr);
         defer {
             _ = self.tokenizer_stack.pop();
+            tokenizer_ptr.deinit();  // Free internal token_string buffer
             self.allocator.destroy(tokenizer_ptr);
         }
 
@@ -202,14 +211,14 @@ pub const Interpreter = struct {
             const maybe_token = try tokenizer.nextToken();
             if (maybe_token == null) break;
 
-            const token = maybe_token.?;
+            var token = maybe_token.?;
+            defer token.deinit(self.allocator);
+
             try self.handleToken(token);
 
             if (token.type == TokenType.eos) {
                 break;
             }
-
-            self.previous_token = token;
         }
     }
 
@@ -240,65 +249,88 @@ pub const Interpreter = struct {
 
     fn handleStringToken(self: *Interpreter, token: Token) !void {
         const str_copy = try self.allocator.dupe(u8, token.string);
-        const str_ptr = try self.allocator.create([]const u8);
-        str_ptr.* = str_copy;
+        errdefer self.allocator.free(str_copy);
 
-        const push_word = PushValueWord.init("<string>", str_ptr);
+        const value = Value.initString(str_copy);
+
+        const push_word = PushValueWord.init("<string>", value);
         var word_ptr = try self.allocator.create(PushValueWord);
+        errdefer self.allocator.destroy(word_ptr);
         word_ptr.* = push_word;
 
-        try self.handleWord(word_ptr.asWord(), token.location);
+        const word = word_ptr.asWord();
+        try self.handleWord(word, token.location);
+
+        // Clean up temporary word if not compiling into definition
+        if (!self.is_compiling) {
+            word.deinit(self.allocator);
+            self.allocator.destroy(word_ptr);
+        }
     }
 
     fn handleDotSymbolToken(self: *Interpreter, token: Token) !void {
         const str_copy = try self.allocator.dupe(u8, token.string);
-        const str_ptr = try self.allocator.create([]const u8);
-        str_ptr.* = str_copy;
+        errdefer self.allocator.free(str_copy);
 
-        const push_word = PushValueWord.init("<dot-symbol>", str_ptr);
+        const value = Value.initString(str_copy);
+
+        const push_word = PushValueWord.init("<dot-symbol>", value);
         var word_ptr = try self.allocator.create(PushValueWord);
+        errdefer self.allocator.destroy(word_ptr);
         word_ptr.* = push_word;
 
-        try self.handleWord(word_ptr.asWord(), token.location);
+        const word = word_ptr.asWord();
+        try self.handleWord(word, token.location);
+
+        // Clean up temporary word if not compiling into definition
+        if (!self.is_compiling) {
+            word.deinit(self.allocator);
+            self.allocator.destroy(word_ptr);
+        }
     }
 
     fn handleStartArrayToken(self: *Interpreter, token: Token) !void {
-        const token_copy = try self.allocator.create(Token);
-        token_copy.* = token;
+        // Push a marker value onto the stack to indicate start of array
+        // TODO: Use a proper marker type instead of null
+        const value = Value.initNull();
 
-        const push_word = PushValueWord.init("<start_array_token>", token_copy);
+        const push_word = PushValueWord.init("<start_array_token>", value);
         var word_ptr = try self.allocator.create(PushValueWord);
+        errdefer self.allocator.destroy(word_ptr);
         word_ptr.* = push_word;
 
-        try self.handleWord(word_ptr.asWord(), token.location);
+        const word = word_ptr.asWord();
+        try self.handleWord(word, token.location);
+
+        // Clean up temporary word if not compiling into definition
+        if (!self.is_compiling) {
+            word.deinit(self.allocator);
+            self.allocator.destroy(word_ptr);
+        }
     }
 
     fn handleEndArrayToken(self: *Interpreter, token: Token) !void {
         _ = token;
-        var items = ArrayList(?*anyopaque){};
+        var items: std.ArrayList(Value) = .{};
 
         while (true) {
             const item = try self.stackPop();
 
-            // Check if it's a START_ARRAY token
-            if (item) |ptr| {
-                const token_ptr: *Token = @ptrCast(@alignCast(ptr));
-                if (token_ptr.type == TokenType.start_array) {
-                    break;
-                }
+            // Check if it's a START_ARRAY marker (null value)
+            // TODO: Use a proper marker type instead of relying on null
+            if (item == .null_value) {
+                break;
             }
 
             try items.append(self.allocator, item);
         }
 
         // Reverse the items
-        std.mem.reverse(?*anyopaque, items.items);
+        std.mem.reverse(Value, items.items);
 
-        const array_slice = try items.toOwnedSlice(self.allocator);
-        const array_ptr = try self.allocator.create([]?*anyopaque);
-        array_ptr.* = array_slice;
-
-        try self.stackPush(array_ptr);
+        // Create array value
+        const array_value = Value{ .array_value = items };
+        try self.stackPush(array_value);
     }
 
     fn handleStartModuleToken(self: *Interpreter, token: Token) !void {
@@ -397,10 +429,21 @@ pub const Interpreter = struct {
 
     fn handleWordToken(self: *Interpreter, token: Token) !void {
         const w = try self.findWord(token.string);
+
+        // Check if this is a literal word (created in findLiteralWord)
+        const is_literal = std.mem.eql(u8, w.getName(), "<literal>");
+
         try self.handleWord(w, token.location);
+
+        // Clean up literal words if not compiling
+        if (is_literal and !self.is_compiling) {
+            const word_ptr: *PushValueWord = @ptrCast(@alignCast(w.ptr));
+            w.deinit(self.allocator);
+            self.allocator.destroy(word_ptr);
+        }
     }
 
-    fn handleWord(self: *Interpreter, w: Word, location: errors.CodeLocation) !void {
+    fn handleWord(self: *Interpreter, w: Word, location: tokenizer_mod.CodeLocation) !void {
         _ = location;
         if (self.is_compiling and self.cur_definition != null) {
             try self.cur_definition.?.addWord(w);

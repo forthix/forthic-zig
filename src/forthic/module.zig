@@ -7,6 +7,7 @@ const Word = word_mod.Word;
 const variable_mod = @import("variable.zig");
 const Variable = variable_mod.Variable;
 const errors = @import("errors.zig");
+const Value = @import("value.zig").Value;
 
 // Forward declaration
 pub const Interpreter = @import("interpreter.zig").Interpreter;
@@ -41,9 +42,19 @@ pub const Module = struct {
     }
 
     pub fn deinit(self: *Module) void {
+        // Note: Don't call word.deinit() here - words may be imported from other modules
+        // Only the module that created the words should free them
         self.words.deinit(self.allocator);
         self.exportable.deinit(self.allocator);
+
+        // Clean up variables - free both keys and values
+        var var_iter = self.variables.iterator();
+        while (var_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);  // Free name
+            entry.value_ptr.deinit(self.allocator);  // Free value
+        }
         self.variables.deinit();
+
         self.modules.deinit();
 
         var it = self.module_prefixes.iterator();
@@ -91,8 +102,8 @@ pub const Module = struct {
     pub fn importModule(self: *Module, prefix: []const u8, module: *Module, interp: *Interpreter) !void {
         _ = interp; // Will be needed for creating ExecuteWords
 
-        const exported_words = try self.exportableWords();
-        defer self.allocator.free(exported_words);
+        const exported_words = try module.exportableWords();
+        defer module.allocator.free(exported_words);
 
         for (exported_words) |exported_word| {
             if (prefix.len == 0) {
@@ -186,10 +197,28 @@ pub const Module = struct {
     // Variable Management
     // ========================================================================
 
-    pub fn addVariable(self: *Module, name: []const u8, value: ?*anyopaque) !void {
+    pub fn addVariable(self: *Module, name: []const u8, value: Value) !void {
         if (!self.variables.contains(name)) {
-            const variable = Variable.init(name, value);
-            try self.variables.put(name, variable);
+            const name_copy = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(name_copy);
+
+            const variable = Variable.init(name_copy, value);
+            try self.variables.put(name_copy, variable);
+        }
+    }
+
+    pub fn setVariable(self: *Module, name: []const u8, value: Value) !void {
+        // If variable exists, free old value and update
+        if (self.variables.getPtr(name)) |var_ptr| {
+            var_ptr.value.deinit(self.allocator);
+            var_ptr.value = value;
+        } else {
+            // New variable - duplicate name
+            const name_copy = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(name_copy);
+
+            const variable = Variable.init(name_copy, value);
+            try self.variables.put(name_copy, variable);
         }
     }
 
@@ -263,14 +292,14 @@ pub const ExecuteWord = struct {
 pub const ModuleMemoWord = struct {
     word: Word,
     has_value: bool,
-    value: ?*anyopaque,
+    value: Value,
     location: ?errors.CodeLocation,
 
     pub fn init(w: Word) ModuleMemoWord {
         return ModuleMemoWord{
             .word = w,
             .has_value = false,
-            .value = null,
+            .value = Value.initNull(),
             .location = null,
         };
     }
@@ -301,7 +330,8 @@ pub const ModuleMemoWord = struct {
         if (!self.has_value) {
             try self.refresh(interp);
         }
-        try interp.stackPush(self.value);
+        const cloned = try self.value.clone(interp.allocator);
+        try interp.stackPush(cloned);
     }
 
     fn getName(ptr: *anyopaque) []const u8 {
@@ -320,8 +350,10 @@ pub const ModuleMemoWord = struct {
     }
 
     fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
-        _ = allocator;
-        _ = ptr;
+        var self: *ModuleMemoWord = @ptrCast(@alignCast(ptr));
+        if (self.has_value) {
+            self.value.deinit(allocator);
+        }
     }
 };
 
@@ -418,7 +450,8 @@ pub const ModuleMemoBangAtWord = struct {
     fn execute(ptr: *anyopaque, interp: *Interpreter) !void {
         const self: *ModuleMemoBangAtWord = @ptrCast(@alignCast(ptr));
         try self.memo_word.refresh(interp);
-        try interp.stackPush(self.memo_word.value);
+        const cloned = try self.memo_word.value.clone(interp.allocator);
+        try interp.stackPush(cloned);
     }
 
     fn getName(ptr: *anyopaque) []const u8 {

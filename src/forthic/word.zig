@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const errors = @import("errors.zig");
+const Value = @import("value.zig").Value;
 
 // Forward declaration
 pub const Interpreter = @import("interpreter.zig").Interpreter;
@@ -78,7 +79,7 @@ pub const Word = struct {
 
 pub const PushValueWord = struct {
     name: []const u8,
-    value: ?*anyopaque,
+    value: Value,
     location: ?errors.CodeLocation,
 
     const vtable = Word.VTable{
@@ -89,7 +90,7 @@ pub const PushValueWord = struct {
         .deinit = deinitImpl,
     };
 
-    pub fn init(name: []const u8, value: ?*anyopaque) PushValueWord {
+    pub fn init(name: []const u8, value: Value) PushValueWord {
         return PushValueWord{
             .name = name,
             .value = value,
@@ -106,7 +107,8 @@ pub const PushValueWord = struct {
 
     fn execute(ptr: *anyopaque, interp: *Interpreter) !void {
         const self: *PushValueWord = @ptrCast(@alignCast(ptr));
-        try interp.stackPush(self.value);
+        const cloned = try self.value.clone(interp.allocator);
+        try interp.stackPush(cloned);
     }
 
     fn getName(ptr: *anyopaque) []const u8 {
@@ -125,9 +127,8 @@ pub const PushValueWord = struct {
     }
 
     fn deinitImpl(ptr: *anyopaque, allocator: Allocator) void {
-        _ = allocator;
-        _ = ptr;
-        // Value ownership is not managed by the word
+        var self: *PushValueWord = @ptrCast(@alignCast(ptr));
+        self.value.deinit(allocator);
     }
 };
 
@@ -178,7 +179,8 @@ pub const ModuleWord = struct {
         self.handler(interp) catch |err| {
             // Try error handlers
             for (self.error_handlers.items) |handler| {
-                handler(err, self.asWord(), interp) catch continue;
+                var word = self.asWord();
+                handler(err, &word, interp) catch continue;
                 return; // Handler succeeded
             }
             return err; // No handler succeeded, propagate error
@@ -204,6 +206,7 @@ pub const ModuleWord = struct {
         const self: *ModuleWord = @ptrCast(@alignCast(ptr));
         _ = allocator;
         self.deinit();
+        // Note: Don't destroy self here - the owning module will handle it
     }
 
     pub fn addErrorHandler(self: *ModuleWord, handler: ErrorHandler) !void {
@@ -262,7 +265,8 @@ pub const DefinitionWord = struct {
             word.execute(interp) catch |err| {
                 // Try error handlers
                 for (self.error_handlers.items) |handler| {
-                    handler(err, self.asWord(), interp) catch continue;
+                    var self_word = self.asWord();
+                    handler(err, &self_word, interp) catch continue;
                     continue; // Handler succeeded, continue with next word
                 }
                 return err; // No handler succeeded, propagate error

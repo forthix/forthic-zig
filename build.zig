@@ -36,13 +36,25 @@ pub fn build(b: *std.Build) void {
     });
     literals_tests.root_module.addImport("forthic", forthic_module);
 
+    // Core module tests
+    const core_module_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/core_module_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    core_module_tests.root_module.addImport("forthic", forthic_module);
+
     // Add all test runs
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const run_tokenizer_tests = b.addRunArtifact(tokenizer_tests);
     const run_literals_tests = b.addRunArtifact(literals_tests);
+    const run_core_module_tests = b.addRunArtifact(core_module_tests);
 
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_tokenizer_tests.step);
     test_step.dependOn(&run_literals_tests.step);
+    test_step.dependOn(&run_core_module_tests.step);
 }

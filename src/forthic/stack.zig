@@ -2,44 +2,51 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const errors = @import("errors.zig");
+const Value = @import("value.zig").Value;
 
 /// ============================================================================
 /// Stack - LIFO data stack for interpreter
 /// ============================================================================
 
 pub const Stack = struct {
-    items: ArrayList(?*anyopaque),
+    items: ArrayList(Value),
+    allocator: Allocator,
 
     pub fn init(allocator: Allocator) Stack {
-        _ = allocator;
+        const items = ArrayList(Value){};
         return Stack{
-            .items = ArrayList(?*anyopaque){},
+            .items = items,
+            .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *Stack, allocator: Allocator) void {
-        self.items.deinit(allocator);
+    pub fn deinit(self: *Stack) void {
+        // Free all values on stack
+        for (self.items.items) |*item| {
+            item.deinit(self.allocator);
+        }
+        self.items.deinit(self.allocator);
     }
 
-    /// Push value onto stack
-    pub fn push(self: *Stack, allocator: Allocator, value: ?*anyopaque) !void {
-        try self.items.append(allocator, value);
+    /// Push value onto stack (takes ownership)
+    pub fn push(self: *Stack, value: Value) !void {
+        try self.items.append(self.allocator, value);
     }
 
-    /// Pop value from stack
-    pub fn pop(self: *Stack) !?*anyopaque {
+    /// Pop value from stack (transfers ownership)
+    pub fn pop(self: *Stack) !Value {
         if (self.items.items.len == 0) {
             return errors.ForthicErrorType.StackUnderflow;
         }
-        return self.items.pop().?;
+        return self.items.pop() orelse return errors.ForthicErrorType.StackUnderflow;
     }
 
-    /// Peek at top value without removing
-    pub fn peek(self: *const Stack) !?*anyopaque {
+    /// Peek at top value without removing (returns reference)
+    pub fn peek(self: *const Stack) !*const Value {
         if (self.items.items.len == 0) {
             return errors.ForthicErrorType.StackUnderflow;
         }
-        return self.items.items[self.items.items.len - 1];
+        return &self.items.items[self.items.items.len - 1];
     }
 
     /// Get stack length
@@ -48,24 +55,27 @@ pub const Stack = struct {
     }
 
     /// Clear all items
-    pub fn clear(self: *Stack, allocator: Allocator) void {
-        _ = allocator;
+    pub fn clear(self: *Stack) void {
+        for (self.items.items) |*item| {
+            item.deinit(self.allocator);
+        }
         self.items.clearRetainingCapacity();
     }
 
     /// Get item at index (0 = bottom, length-1 = top)
-    pub fn at(self: *const Stack, index: usize) !?*anyopaque {
+    pub fn at(self: *const Stack, index: usize) !*const Value {
         if (index >= self.items.items.len) {
             return error.OutOfMemory; // Using this as index out of bounds
         }
-        return self.items.items[index];
+        return &self.items.items[index];
     }
 
-    /// Set item at index
-    pub fn set(self: *Stack, index: usize, value: ?*anyopaque) !void {
+    /// Set item at index (takes ownership of new value, frees old)
+    pub fn set(self: *Stack, index: usize, value: Value) !void {
         if (index >= self.items.items.len) {
             return error.OutOfMemory;
         }
+        self.items.items[index].deinit(self.allocator);
         self.items.items[index] = value;
     }
 };
@@ -77,25 +87,21 @@ pub const Stack = struct {
 test "Stack: push and pop" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator);
-    defer stack.deinit(allocator);
+    defer stack.deinit();
 
-    const val1: i32 = 42;
-    const val1_ptr = try allocator.create(i32);
-    defer allocator.destroy(val1_ptr);
-    val1_ptr.* = val1;
-
-    try stack.push(allocator, val1_ptr);
+    const val1 = Value.initInt(42);
+    try stack.push(val1);
     try std.testing.expectEqual(@as(usize, 1), stack.length());
 
     const popped = try stack.pop();
-    try std.testing.expectEqual(@as(?*anyopaque, val1_ptr), popped);
+    try std.testing.expectEqual(@as(i64, 42), popped.int_value);
     try std.testing.expectEqual(@as(usize, 0), stack.length());
 }
 
 test "Stack: underflow" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator);
-    defer stack.deinit(allocator);
+    defer stack.deinit();
 
     const result = stack.pop();
     try std.testing.expectError(errors.ForthicErrorType.StackUnderflow, result);
@@ -104,44 +110,23 @@ test "Stack: underflow" {
 test "Stack: peek" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator);
-    defer stack.deinit(allocator);
+    defer stack.deinit();
 
-    const val1: i32 = 42;
-    const val1_ptr = try allocator.create(i32);
-    defer allocator.destroy(val1_ptr);
-    val1_ptr.* = val1;
-
-    try stack.push(allocator, val1_ptr);
+    try stack.push(Value.initInt(42));
 
     const peeked = try stack.peek();
-    try std.testing.expectEqual(@as(?*anyopaque, val1_ptr), peeked);
+    try std.testing.expectEqual(@as(i64, 42), peeked.int_value);
     try std.testing.expectEqual(@as(usize, 1), stack.length()); // Still on stack
 }
 
 test "Stack: multiple items" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator);
-    defer stack.deinit(allocator);
+    defer stack.deinit();
 
-    const val1: i32 = 1;
-    const val2: i32 = 2;
-    const val3: i32 = 3;
-
-    const val1_ptr = try allocator.create(i32);
-    defer allocator.destroy(val1_ptr);
-    val1_ptr.* = val1;
-
-    const val2_ptr = try allocator.create(i32);
-    defer allocator.destroy(val2_ptr);
-    val2_ptr.* = val2;
-
-    const val3_ptr = try allocator.create(i32);
-    defer allocator.destroy(val3_ptr);
-    val3_ptr.* = val3;
-
-    try stack.push(allocator, val1_ptr);
-    try stack.push(allocator, val2_ptr);
-    try stack.push(allocator, val3_ptr);
+    try stack.push(Value.initInt(1));
+    try stack.push(Value.initInt(2));
+    try stack.push(Value.initInt(3));
 
     try std.testing.expectEqual(@as(usize, 3), stack.length());
 
@@ -149,25 +134,20 @@ test "Stack: multiple items" {
     const pop2 = try stack.pop();
     const pop1 = try stack.pop();
 
-    try std.testing.expectEqual(@as(?*anyopaque, val3_ptr), pop3);
-    try std.testing.expectEqual(@as(?*anyopaque, val2_ptr), pop2);
-    try std.testing.expectEqual(@as(?*anyopaque, val1_ptr), pop1);
+    try std.testing.expectEqual(@as(i64, 3), pop3.int_value);
+    try std.testing.expectEqual(@as(i64, 2), pop2.int_value);
+    try std.testing.expectEqual(@as(i64, 1), pop1.int_value);
 }
 
 test "Stack: clear" {
     const allocator = std.testing.allocator;
     var stack = Stack.init(allocator);
-    defer stack.deinit(allocator);
+    defer stack.deinit();
 
-    const val1: i32 = 42;
-    const val1_ptr = try allocator.create(i32);
-    defer allocator.destroy(val1_ptr);
-    val1_ptr.* = val1;
+    try stack.push(Value.initInt(42));
+    try stack.push(Value.initBool(true));
+    try stack.push(Value.initFloat(3.14));
 
-    try stack.push(allocator, val1_ptr);
-    try stack.push(allocator, val1_ptr);
-    try stack.push(allocator, val1_ptr);
-
-    stack.clear(allocator);
+    stack.clear();
     try std.testing.expectEqual(@as(usize, 0), stack.length());
 }
