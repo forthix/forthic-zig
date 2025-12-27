@@ -47,8 +47,14 @@ test "tokenizer: array tokens" {
     try testing.expectEqualStrings("1", token2.string);
 
     // Skip remaining tokens
-    _ = try t.nextToken();
-    _ = try t.nextToken();
+    {
+        const token3 = (try t.nextToken()).?;
+        defer allocator.free(token3.string);
+    }
+    {
+        const token4 = (try t.nextToken()).?;
+        defer allocator.free(token4.string);
+    }
 
     const token_end = (try t.nextToken()).?;
     defer allocator.free(token_end.string);
@@ -81,8 +87,14 @@ test "tokenizer: definition tokens" {
     try testing.expectEqualStrings("DOUBLE", token1.string);
 
     // Skip middle tokens
-    _ = try t.nextToken();
-    _ = try t.nextToken();
+    {
+        const token2 = (try t.nextToken()).?;
+        defer allocator.free(token2.string);
+    }
+    {
+        const token3 = (try t.nextToken()).?;
+        defer allocator.free(token3.string);
+    }
 
     const token_end = (try t.nextToken()).?;
     defer allocator.free(token_end.string);
