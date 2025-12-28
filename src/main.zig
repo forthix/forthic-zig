@@ -32,6 +32,21 @@ pub const modules = struct {
     };
 };
 
+// gRPC support
+pub const grpc = struct {
+    pub const c_bindings = @import("grpc/c_bindings.zig");
+    pub const serializer = @import("grpc/serializer.zig");
+    pub const client = @import("grpc/client.zig");
+    pub const remote_word = @import("grpc/remote_word.zig");
+    pub const remote_module = @import("grpc/remote_module.zig");
+    pub const runtime_manager = @import("grpc/runtime_manager.zig");
+
+    pub const GrpcClient = client.GrpcClient;
+    pub const RemoteWord = remote_word.RemoteWord;
+    pub const RemoteModule = remote_module.RemoteModule;
+    pub const RuntimeManager = runtime_manager.RuntimeManager;
+};
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
