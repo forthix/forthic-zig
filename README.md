@@ -137,7 +137,7 @@ Zig's manual memory management and comptime features provide excellent performan
 
 ## License
 
-Apache 2.0
+BSD 2-CLAUSE
 
 ## Links
 
